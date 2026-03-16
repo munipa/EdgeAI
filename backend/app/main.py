@@ -1,8 +1,13 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends
+from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
+from app.database import engine, get_db
+from app.models import Base
 from datetime import datetime
 
 app = FastAPI(title="Sports Analytics API")
+
+Base.metadata.create_all(bind=engine)
 
 # Create an instance of our ESPN service
 espn = ESPNService()
@@ -20,12 +25,12 @@ def read_root():
     }
 
 @app.get("/games/nba")
-def get_nba_games(date: str = Query(None, description="Date in YYYYMMDD format, e.g., 20260122")):
+def get_nba_games(date: str = Query(None, description="Date in YYYYMMDD format, e.g., 20260122"), db: Session = Depends(get_db)):
     """
     Get NBA games for a specific date
     If no date provided, returns today's games
     """
-    games = espn.get_nba_games(date)
+    games = espn.get_nba_games(date, db=db)
     return {
         "sport": "NBA",
         "date": date or datetime.now().strftime("%Y%m%d"),
@@ -34,9 +39,9 @@ def get_nba_games(date: str = Query(None, description="Date in YYYYMMDD format, 
     }
 
 @app.get("/games/nba/today")
-def get_todays_nba_games():
+def get_todays_nba_games(db: Session = Depends(get_db)):
     """Get today's NBA games"""
-    games = espn.get_nba_games()
+    games = espn.get_nba_games(db=db)
     return {
         "sport": "NBA",
         "date": datetime.now().strftime("%Y-%m-%d"),
