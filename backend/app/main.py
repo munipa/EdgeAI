@@ -332,24 +332,27 @@ def get_team_form(
 
 def _run_backfill(start: datetime, end: datetime):
     from app.database import SessionLocal
-    db = SessionLocal()
     current = start
     total_days = 0
     total_games = 0
-    try:
-        while current <= end:
-            date_str = current.strftime("%Y%m%d")
+    errors = 0
+    while current <= end:
+        date_str = current.strftime("%Y%m%d")
+        db = SessionLocal()
+        try:
             games = espn.get_nba_games(date=date_str, db=db)
             total_games += len(games)
             total_days += 1
             print(f"Backfill: {date_str} — {len(games)} games")
-            current += timedelta(days=1)
-            time.sleep(0.1)  # be polite to ESPN API
-    except Exception as e:
-        print(f"Backfill error: {e}")
-    finally:
-        db.close()
-    print(f"Backfill complete: {total_days} days, {total_games} games synced")
+        except Exception as e:
+            db.rollback()
+            errors += 1
+            print(f"Backfill error on {date_str}: {e}")
+        finally:
+            db.close()
+        current += timedelta(days=1)
+        time.sleep(0.3)  # be polite to ESPN API
+    print(f"Backfill complete: {total_days} days, {total_games} games synced, {errors} errors")
 
 
 @app.post("/admin/backfill/nba")
