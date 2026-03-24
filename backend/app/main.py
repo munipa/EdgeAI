@@ -2,9 +2,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
+from app.services.tennis_service import TennisService
 from app.database import engine, get_db
 from app.models import Base
 from app.models.nba import Team, Game, TeamStats, Injury
+from app.models.tennis import TennisPlayer, TennisMatch
 from app import scheduler as sched
 from datetime import datetime, timedelta
 import time
@@ -22,6 +24,7 @@ app = FastAPI(title="Sports Analytics API", lifespan=lifespan)
 
 # Create an instance of our ESPN service
 espn = ESPNService()
+tennis = TennisService()
 
 @app.get("/")
 def read_root():
@@ -29,17 +32,18 @@ def read_root():
         "message": "Welcome to Sports Analytics API!",
         "status": "running",
         "endpoints": [
-            "/games/nba",
-            "/games/nba/today",
-            "/games/nba/history",
-            "/standings/nba",
-            "/teams/nba",
-            "/teams/nba/{team_id}/games",
-            "/teams/nba/{team_id}/stats",
-            "/teams/nba/{team_id}/form",
-            "/teams/nba/h2h",
-            "/injuries/nba",
-            "POST /admin/backfill/nba",
+            "/games/nba", "/games/nba/today", "/games/nba/history",
+            "/standings/nba", "/teams/nba", "/teams/nba/{team_id}/games",
+            "/teams/nba/{team_id}/stats", "/teams/nba/{team_id}/form",
+            "/teams/nba/h2h", "/injuries/nba", "POST /admin/backfill/nba",
+            "/matches/tennis", "/matches/tennis/today",
+            "/matches/tennis/history",
+            "/players/tennis",
+            "/players/tennis/{player_id}/matches",
+            "/players/tennis/{player_id}/form",
+            "/players/tennis/{player_id}/surface",
+            "/players/tennis/h2h",
+            "POST /admin/backfill/tennis",
         ]
     }
 
@@ -396,4 +400,384 @@ def get_fake_games():
             {"id": 1, "home_team": "Lakers", "away_team": "Warriors"},
             {"id": 2, "home_team": "Celtics", "away_team": "Heat"}
         ]
+    }
+
+
+# =============================================================================
+# Tennis endpoints
+# =============================================================================
+
+VALID_TOURS = {"atp", "wta"}
+
+
+def _validate_tour(tour: str):
+    if tour not in VALID_TOURS:
+        raise HTTPException(status_code=400, detail="tour must be 'atp' or 'wta'")
+
+
+@app.get("/matches/tennis")
+def get_tennis_matches(
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    date: str = Query(None, description="Date in YYYYMMDD format"),
+    db: Session = Depends(get_db),
+):
+    """Get ATP or WTA matches for a specific date (live from ESPN + persisted)."""
+    _validate_tour(tour)
+    matches = tennis.get_matches(tour, date=date, db=db)
+    return {
+        "tour": tour.upper(),
+        "date": date or datetime.now().strftime("%Y%m%d"),
+        "count": len(matches),
+        "matches": matches,
+    }
+
+
+@app.get("/matches/tennis/today")
+def get_todays_tennis_matches(
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    db: Session = Depends(get_db),
+):
+    """Get today's ATP or WTA matches."""
+    _validate_tour(tour)
+    matches = tennis.get_matches(tour, db=db)
+    return {
+        "tour": tour.upper(),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "count": len(matches),
+        "matches": matches,
+    }
+
+
+@app.get("/matches/tennis/history")
+def get_tennis_match_history(
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    start: str = Query(..., description="Start date YYYYMMDD"),
+    end: str = Query(..., description="End date YYYYMMDD"),
+    db: Session = Depends(get_db),
+):
+    """Get stored tennis matches for a date range."""
+    _validate_tour(tour)
+    try:
+        start_dt = datetime.strptime(start, "%Y%m%d")
+        end_dt = datetime.strptime(end, "%Y%m%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be in YYYYMMDD format")
+
+    matches = (
+        db.query(TennisMatch)
+        .filter(
+            TennisMatch.tour == tour,
+            TennisMatch.date >= start_dt,
+            TennisMatch.date <= end_dt,
+        )
+        .order_by(TennisMatch.date)
+        .all()
+    )
+
+    return {
+        "tour": tour.upper(),
+        "start": start,
+        "end": end,
+        "count": len(matches),
+        "matches": [_serialize_match(m, db) for m in matches],
+    }
+
+
+@app.get("/players/tennis")
+def get_tennis_players(
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    db: Session = Depends(get_db),
+):
+    """List all stored tennis players for a tour, ordered by ranking."""
+    _validate_tour(tour)
+    players = (
+        db.query(TennisPlayer)
+        .filter(TennisPlayer.tour == tour)
+        .order_by(TennisPlayer.ranking.asc().nullslast())
+        .all()
+    )
+    return {
+        "tour": tour.upper(),
+        "count": len(players),
+        "players": [_serialize_player(p) for p in players],
+    }
+
+
+@app.get("/players/tennis/{player_id}/matches")
+def get_player_matches(
+    player_id: str,
+    db: Session = Depends(get_db),
+):
+    """Get all stored matches for a specific player."""
+    player = db.get(TennisPlayer, player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    matches = (
+        db.query(TennisMatch)
+        .filter(
+            (TennisMatch.player1_id == player_id) | (TennisMatch.player2_id == player_id)
+        )
+        .order_by(TennisMatch.date.desc())
+        .all()
+    )
+
+    return {
+        "player": _serialize_player(player),
+        "count": len(matches),
+        "matches": [_serialize_match(m, db) for m in matches],
+    }
+
+
+@app.get("/players/tennis/{player_id}/form")
+def get_player_form(
+    player_id: str,
+    matches: int = Query(10, description="Number of recent matches to evaluate", ge=1, le=30),
+    db: Session = Depends(get_db),
+):
+    """Recent form for a player — win/loss over last N completed matches."""
+    player = db.get(TennisPlayer, player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    recent = (
+        db.query(TennisMatch)
+        .filter(
+            ((TennisMatch.player1_id == player_id) | (TennisMatch.player2_id == player_id)),
+            TennisMatch.status == "Final",
+            TennisMatch.winner_id.isnot(None),
+        )
+        .order_by(TennisMatch.date.desc())
+        .limit(matches)
+        .all()
+    )
+
+    results = []
+    for m in recent:
+        won = m.winner_id == player_id
+        opp_id = m.player2_id if m.player1_id == player_id else m.player1_id
+        opp = db.get(TennisPlayer, opp_id)
+        results.append({
+            "date": m.date.isoformat(),
+            "opponent": opp.name if opp else opp_id,
+            "opponent_ranking": opp.ranking if opp else None,
+            "surface": m.surface,
+            "round": m.round,
+            "score": m.score,
+            "result": "W" if won else "L",
+        })
+
+    wins = sum(1 for r in results if r["result"] == "W")
+    losses = len(results) - wins
+
+    streak_char = results[0]["result"] if results else None
+    streak_count = 0
+    for r in results:
+        if r["result"] == streak_char:
+            streak_count += 1
+        else:
+            break
+
+    return {
+        "player_id": player_id,
+        "player_name": player.name,
+        "ranking": player.ranking,
+        "last_n_matches": len(results),
+        "wins": wins,
+        "losses": losses,
+        "win_pct": round(wins / len(results), 3) if results else 0,
+        "streak": f"{streak_char}{streak_count}" if streak_char else None,
+        "results": results,
+    }
+
+
+@app.get("/players/tennis/{player_id}/surface")
+def get_player_surface_stats(
+    player_id: str,
+    db: Session = Depends(get_db),
+):
+    """Win % broken down by surface for a player."""
+    player = db.get(TennisPlayer, player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    matches = (
+        db.query(TennisMatch)
+        .filter(
+            ((TennisMatch.player1_id == player_id) | (TennisMatch.player2_id == player_id)),
+            TennisMatch.status == "Final",
+            TennisMatch.winner_id.isnot(None),
+            TennisMatch.surface.isnot(None),
+        )
+        .all()
+    )
+
+    surface_stats: dict[str, dict] = {}
+    for m in matches:
+        surface = m.surface
+        if surface not in surface_stats:
+            surface_stats[surface] = {"wins": 0, "losses": 0}
+        if m.winner_id == player_id:
+            surface_stats[surface]["wins"] += 1
+        else:
+            surface_stats[surface]["losses"] += 1
+
+    breakdown = {}
+    for surface, s in surface_stats.items():
+        total = s["wins"] + s["losses"]
+        breakdown[surface] = {
+            "wins": s["wins"],
+            "losses": s["losses"],
+            "matches": total,
+            "win_pct": round(s["wins"] / total, 3) if total else 0,
+        }
+
+    return {
+        "player_id": player_id,
+        "player_name": player.name,
+        "ranking": player.ranking,
+        "surface_breakdown": breakdown,
+    }
+
+
+@app.get("/players/tennis/h2h")
+def get_tennis_h2h(
+    player1: str = Query(..., description="First player ESPN ID"),
+    player2: str = Query(..., description="Second player ESPN ID"),
+    surface: str = Query(None, description="Filter by surface: Hard, Clay, Grass"),
+    db: Session = Depends(get_db),
+):
+    """Head-to-head record between two players, optionally filtered by surface."""
+    p1 = db.get(TennisPlayer, player1)
+    p2 = db.get(TennisPlayer, player2)
+    if not p1:
+        raise HTTPException(status_code=404, detail=f"Player {player1} not found")
+    if not p2:
+        raise HTTPException(status_code=404, detail=f"Player {player2} not found")
+
+    query = db.query(TennisMatch).filter(
+        (
+            ((TennisMatch.player1_id == player1) & (TennisMatch.player2_id == player2)) |
+            ((TennisMatch.player1_id == player2) & (TennisMatch.player2_id == player1))
+        ),
+        TennisMatch.status == "Final",
+        TennisMatch.winner_id.isnot(None),
+    )
+    if surface:
+        query = query.filter(TennisMatch.surface == surface)
+
+    matchups = query.order_by(TennisMatch.date.desc()).all()
+
+    p1_wins, p2_wins = 0, 0
+    games_list = []
+    for m in matchups:
+        p1_won = m.winner_id == player1
+        if p1_won:
+            p1_wins += 1
+        else:
+            p2_wins += 1
+        games_list.append({
+            "date": m.date.isoformat(),
+            "surface": m.surface,
+            "round": m.round,
+            "score": m.score,
+            "winner": p1.name if p1_won else p2.name,
+        })
+
+    return {
+        "player1": {"id": p1.id, "name": p1.name, "ranking": p1.ranking, "wins": p1_wins},
+        "player2": {"id": p2.id, "name": p2.name, "ranking": p2.ranking, "wins": p2_wins},
+        "surface_filter": surface,
+        "total_matches": len(matchups),
+        "matches": games_list,
+    }
+
+
+def _serialize_player(p: TennisPlayer) -> dict:
+    return {
+        "id": p.id,
+        "name": p.name,
+        "nationality": p.nationality,
+        "tour": p.tour,
+        "ranking": p.ranking,
+        "logo": p.logo,
+    }
+
+
+def _serialize_match(m: TennisMatch, db: Session) -> dict:
+    p1 = db.get(TennisPlayer, m.player1_id)
+    p2 = db.get(TennisPlayer, m.player2_id)
+    winner = db.get(TennisPlayer, m.winner_id) if m.winner_id else None
+    return {
+        "id": m.id,
+        "date": m.date.isoformat(),
+        "tour": m.tour,
+        "round": m.round,
+        "surface": m.surface,
+        "status": m.status,
+        "player1": p1.name if p1 else m.player1_id,
+        "player2": p2.name if p2 else m.player2_id,
+        "winner": winner.name if winner else None,
+        "score": m.score,
+    }
+
+
+def _run_tennis_backfill(tour: str, start: datetime, end: datetime):
+    from app.database import SessionLocal
+    current = start
+    total_days = 0
+    total_matches = 0
+    errors = 0
+    while current <= end:
+        date_str = current.strftime("%Y%m%d")
+        db = SessionLocal()
+        try:
+            matches = tennis.get_matches(tour, date=date_str, db=db)
+            total_matches += len(matches)
+            total_days += 1
+            print(f"Tennis backfill [{tour.upper()}]: {date_str} — {len(matches)} matches")
+        except Exception as e:
+            db.rollback()
+            errors += 1
+            print(f"Tennis backfill error on {date_str}: {e}")
+        finally:
+            db.close()
+        current += timedelta(days=1)
+        time.sleep(0.3)
+    print(f"Tennis backfill complete [{tour.upper()}]: {total_days} days, {total_matches} matches, {errors} errors")
+
+
+@app.post("/admin/backfill/tennis")
+def backfill_tennis_matches(
+    background_tasks: BackgroundTasks,
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    start: str = Query(..., description="Start date YYYYMMDD"),
+    end: str = Query(..., description="End date YYYYMMDD"),
+):
+    """
+    Backfill tennis matches from ESPN for a date range.
+    Runs in the background — check server logs for progress.
+    """
+    _validate_tour(tour)
+    try:
+        start_dt = datetime.strptime(start, "%Y%m%d")
+        end_dt = datetime.strptime(end, "%Y%m%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be in YYYYMMDD format")
+
+    if end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    days = (end_dt - start_dt).days + 1
+    if days > 400:
+        raise HTTPException(status_code=400, detail="Date range cannot exceed 400 days")
+
+    background_tasks.add_task(_run_tennis_backfill, tour, start_dt, end_dt)
+    return {
+        "status": "started",
+        "tour": tour.upper(),
+        "start": start,
+        "end": end,
+        "days_to_sync": days,
+        "message": "Tennis backfill running in background. Check server logs for progress.",
     }
