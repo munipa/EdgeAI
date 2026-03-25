@@ -32,18 +32,27 @@ class TennisService:
 
         matches = []
         for event in data.get("events", []):
-            match = self._parse_event(event, tour)
-            if match is None:
-                continue
-            matches.append(match)
-            if db:
-                self._save_match(db, match)
+            for grouping in event.get("groupings", []):
+                for competition in grouping.get("competitions", []):
+                    match = self._parse_competition(event, competition, tour)
+                    if match is None:
+                        continue
+                    matches.append(match)
+                    if db:
+                        self._save_match(db, match)
 
         return matches
 
     def _parse_event(self, event: dict, tour: str) -> dict | None:
+        # Legacy shim — not called in normal flow anymore
+        groupings = event.get("groupings", [])
+        if not groupings:
+            return None
+        competition = groupings[0]["competitions"][0]
+        return self._parse_competition(event, competition, tour)
+
+    def _parse_competition(self, event: dict, competition: dict, tour: str) -> dict | None:
         try:
-            competition = event["competitions"][0]
             competitors = competition.get("competitors", [])
             if len(competitors) < 2:
                 return None
@@ -69,11 +78,11 @@ class TennisService:
             tournament_id, tournament_name = self._extract_tournament(event)
 
             return {
-                "id": event["id"],
+                "id": competition["id"],
                 "tour": tour,
-                "date": event["date"],
+                "date": competition.get("date", event["date"]),
                 "name": event.get("name", ""),
-                "status": event["status"]["type"]["description"],
+                "status": competition["status"]["type"]["description"],
                 "round": round_name,
                 "surface": surface,
                 "tournament_id": tournament_id,
