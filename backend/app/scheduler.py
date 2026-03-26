@@ -1,7 +1,9 @@
+from datetime import date
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.database import SessionLocal
 from app.services.espn_service import ESPNService
 from app.services.tennis_service import TennisService
+from app.services.feature_service import compute_all_nba_features
 
 scheduler = AsyncIOScheduler()
 espn = ESPNService()
@@ -40,6 +42,16 @@ def sync_nba_injuries():
         db.close()
 
 
+def compute_nba_features():
+    db = SessionLocal()
+    try:
+        compute_all_nba_features(date.today(), db)
+    except Exception as e:
+        print(f"Scheduler: error computing NBA features — {e}")
+    finally:
+        db.close()
+
+
 def sync_todays_atp_matches():
     db = SessionLocal()
     try:
@@ -67,15 +79,17 @@ def start():
     sync_todays_nba_games()
     sync_nba_team_stats()
     sync_nba_injuries()
+    compute_nba_features()
     sync_todays_atp_matches()
     sync_todays_wta_matches()
     # NBA daily at 3am
     scheduler.add_job(sync_todays_nba_games, "cron", hour=3, minute=0)
     scheduler.add_job(sync_nba_team_stats, "cron", hour=3, minute=5)
     scheduler.add_job(sync_nba_injuries, "cron", hour=3, minute=10)
-    # Tennis daily at 3:15am
-    scheduler.add_job(sync_todays_atp_matches, "cron", hour=3, minute=15)
-    scheduler.add_job(sync_todays_wta_matches, "cron", hour=3, minute=20)
+    scheduler.add_job(compute_nba_features, "cron", hour=3, minute=15)
+    # Tennis daily at 3:20am
+    scheduler.add_job(sync_todays_atp_matches, "cron", hour=3, minute=20)
+    scheduler.add_job(sync_todays_wta_matches, "cron", hour=3, minute=25)
     scheduler.start()
 
 

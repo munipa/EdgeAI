@@ -3,9 +3,10 @@ from fastapi import FastAPI, Query, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
 from app.services.tennis_service import TennisService
+from app.services.feature_service import upsert_team_features, compute_all_nba_features, backfill_nba_features
 from app.database import engine, get_db
 from app.models import Base
-from app.models.nba import Team, Game, TeamStats, Injury
+from app.models.nba import Team, Game, TeamStats, Injury, TeamFeatures
 from app.models.tennis import TennisPlayer, TennisMatch
 from app import scheduler as sched
 from datetime import datetime, timedelta
@@ -35,7 +36,8 @@ def read_root():
             "/games/nba", "/games/nba/today", "/games/nba/history",
             "/standings/nba", "/teams/nba", "/teams/nba/{team_id}/games",
             "/teams/nba/{team_id}/stats", "/teams/nba/{team_id}/form",
-            "/teams/nba/h2h", "/injuries/nba", "POST /admin/backfill/nba",
+            "/teams/nba/h2h", "/injuries/nba", "/teams/nba/{team_id}/features",
+            "POST /admin/backfill/nba", "POST /admin/features/nba",
             "/matches/tennis", "/matches/tennis/today",
             "/matches/tennis/history",
             "/players/tennis",
@@ -389,6 +391,110 @@ def backfill_nba_games(
         "end": end,
         "days_to_sync": days,
         "message": "Backfill running in background. Check server logs for progress.",
+    }
+
+
+@app.get("/teams/nba/{team_id}/features")
+def get_team_features(
+    team_id: str,
+    date: str = Query(None, description="Date in YYYYMMDD format. Defaults to today."),
+    db: Session = Depends(get_db),
+):
+    """
+    Get pre-computed feature snapshot for a team on a given date.
+    If no date is provided, returns the most recent available snapshot.
+    """
+    team = db.get(Team, team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    if date:
+        try:
+            as_of = datetime.strptime(date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+        row = (
+            db.query(TeamFeatures)
+            .filter(TeamFeatures.team_id == team_id, TeamFeatures.date == as_of)
+            .first()
+        )
+    else:
+        row = (
+            db.query(TeamFeatures)
+            .filter(TeamFeatures.team_id == team_id)
+            .order_by(TeamFeatures.date.desc())
+            .first()
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No feature snapshot found for this team/date")
+
+    return {
+        "team_id": row.team_id,
+        "team_name": team.name,
+        "date": row.date.isoformat(),
+        "computed_at": row.computed_at.isoformat(),
+        "form": {
+            "form_score_5": row.form_score_5,
+            "form_score_10": row.form_score_10,
+        },
+        "scoring": {
+            "avg_points_scored": row.avg_points_scored,
+            "avg_points_allowed": row.avg_points_allowed,
+        },
+        "splits": {
+            "win_pct_home": row.win_pct_home,
+            "win_pct_away": row.win_pct_away,
+        },
+        "ratings": {
+            "off_rating": row.off_rating,
+            "def_rating": row.def_rating,
+        },
+        "injury_impact": row.injury_impact,
+    }
+
+
+@app.post("/admin/features/nba")
+def trigger_nba_features(
+    background_tasks: BackgroundTasks,
+    date: str = Query(None, description="Date in YYYYMMDD format. Defaults to today."),
+):
+    """
+    Manually trigger NBA feature computation for all teams on a given date.
+    Useful for backfilling features after the game data is loaded.
+    """
+    from datetime import date as date_type
+    if date:
+        try:
+            as_of = datetime.strptime(date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+    else:
+        as_of = date_type.today()
+
+    def _run(as_of):
+        from app.database import SessionLocal
+        db2 = SessionLocal()
+        try:
+            compute_all_nba_features(as_of, db2)
+        finally:
+            db2.close()
+
+    background_tasks.add_task(_run, as_of)
+    return {"status": "started", "date": as_of.isoformat(), "message": "Feature computation running in background."}
+
+
+@app.post("/admin/backfill/features/nba")
+def backfill_nba_feature_history(background_tasks: BackgroundTasks):
+    """
+    Backfill feature snapshots for every game date in the DB.
+    One snapshot per team per game day — covers the full season history.
+    Check server logs for progress.
+    """
+    background_tasks.add_task(backfill_nba_features)
+    return {
+        "status": "started",
+        "message": "NBA feature backfill running in background. Check server logs for progress.",
     }
 
 

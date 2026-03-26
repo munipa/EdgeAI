@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey
+from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.models.base import Base
 
@@ -15,6 +15,7 @@ class Team(Base):
     away_games = relationship("Game", foreign_keys="Game.away_team_id", back_populates="away_team")
     stats = relationship("TeamStats", back_populates="team", uselist=False)
     injuries = relationship("Injury", back_populates="team")
+    features = relationship("TeamFeatures", back_populates="team")
 
 
 class Game(Base):
@@ -68,3 +69,34 @@ class Injury(Base):
     updated_at = Column(DateTime)
 
     team = relationship("Team", back_populates="injuries")
+
+
+class TeamFeatures(Base):
+    __tablename__ = "team_features"
+    __table_args__ = (UniqueConstraint("team_id", "date", name="uq_team_features_team_date"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(String, ForeignKey("teams.id"), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    computed_at = Column(DateTime, nullable=False)
+
+    # Form (exponentially weighted, decay=0.85, most recent = weight 1)
+    form_score_5 = Column(Float)   # last 5 games
+    form_score_10 = Column(Float)  # last 10 games
+
+    # Scoring from actual game results (last 10 completed games)
+    avg_points_scored = Column(Float)
+    avg_points_allowed = Column(Float)
+
+    # Season split win %
+    win_pct_home = Column(Float)
+    win_pct_away = Column(Float)
+
+    # Composite ratings derived from TeamStats (0–1 normalised)
+    off_rating = Column(Float)
+    def_rating = Column(Float)
+
+    # Injury impact: Out=3, Doubtful=2, Questionable=1, Day-To-Day=0.5
+    injury_impact = Column(Float)
+
+    team = relationship("Team", back_populates="features")
