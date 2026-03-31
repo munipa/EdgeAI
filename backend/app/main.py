@@ -4,10 +4,11 @@ from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
 from app.services.tennis_service import TennisService
 from app.services.feature_service import upsert_team_features, compute_all_nba_features, backfill_nba_features
+from app.services.tennis_feature_service import upsert_player_features, compute_all_tennis_features, backfill_tennis_features as backfill_tennis_feature_history
 from app.database import engine, get_db
 from app.models import Base
 from app.models.nba import Team, Game, TeamStats, Injury, TeamFeatures
-from app.models.tennis import TennisPlayer, TennisMatch
+from app.models.tennis import TennisPlayer, TennisMatch, TennisPlayerFeatures
 from app import scheduler as sched
 from datetime import datetime, timedelta
 import time
@@ -46,6 +47,9 @@ def read_root():
             "/players/tennis/{player_id}/surface",
             "/players/tennis/h2h",
             "POST /admin/backfill/tennis",
+            "/players/tennis/{player_id}/features",
+            "POST /admin/features/tennis",
+            "POST /admin/backfill/features/tennis",
         ]
     }
 
@@ -825,6 +829,115 @@ def _serialize_match(m: TennisMatch, db: Session) -> dict:
         "player2": p2.name if p2 else m.player2_id,
         "winner": winner.name if winner else None,
         "score": m.score,
+    }
+
+
+@app.get("/players/tennis/{player_id}/features")
+def get_player_features(
+    player_id: str,
+    date: str = Query(None, description="Date in YYYYMMDD format. Defaults to most recent snapshot."),
+    db: Session = Depends(get_db),
+):
+    """Get pre-computed feature snapshot for a player on a given date."""
+    player = db.get(TennisPlayer, player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    if date:
+        try:
+            as_of = datetime.strptime(date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+        row = (
+            db.query(TennisPlayerFeatures)
+            .filter(TennisPlayerFeatures.player_id == player_id, TennisPlayerFeatures.date == as_of)
+            .first()
+        )
+    else:
+        row = (
+            db.query(TennisPlayerFeatures)
+            .filter(TennisPlayerFeatures.player_id == player_id)
+            .order_by(TennisPlayerFeatures.date.desc())
+            .first()
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No feature snapshot found for this player/date")
+
+    return {
+        "player_id": row.player_id,
+        "player_name": player.name,
+        "ranking": player.ranking,
+        "date": row.date.isoformat(),
+        "computed_at": row.computed_at.isoformat(),
+        "form": {
+            "form_score_5": row.form_score_5,
+            "form_score_10": row.form_score_10,
+        },
+        "win_pct": {
+            "overall": row.overall_win_pct,
+            "recent_20": row.recent_win_pct,
+            "hard": row.win_pct_hard,
+            "clay": row.win_pct_clay,
+            "grass": row.win_pct_grass,
+        },
+        "surface_matches": {
+            "hard": row.matches_hard,
+            "clay": row.matches_clay,
+            "grass": row.matches_grass,
+        },
+        "ratings": {
+            "serve_rating": row.serve_rating,
+            "return_rating": row.return_rating,
+        },
+    }
+
+
+@app.post("/admin/features/tennis")
+def trigger_tennis_features(
+    background_tasks: BackgroundTasks,
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    date: str = Query(None, description="Date in YYYYMMDD format. Defaults to today."),
+):
+    """Manually trigger tennis feature computation for all players in a tour."""
+    _validate_tour(tour)
+    from datetime import date as date_type
+    if date:
+        try:
+            as_of = datetime.strptime(date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+    else:
+        as_of = date_type.today()
+
+    def _run(tour, as_of):
+        from app.database import SessionLocal
+        db2 = SessionLocal()
+        try:
+            compute_all_tennis_features(tour, as_of, db2)
+        finally:
+            db2.close()
+
+    background_tasks.add_task(_run, tour, as_of)
+    return {"status": "started", "tour": tour.upper(), "date": as_of.isoformat(),
+            "message": "Feature computation running in background."}
+
+
+@app.post("/admin/backfill/features/tennis")
+def backfill_tennis_feature_snapshots(
+    background_tasks: BackgroundTasks,
+    tour: str = Query(..., description="'atp' or 'wta'"),
+):
+    """
+    Backfill feature snapshots for every match date in the DB for a tour.
+    Only computes for players active on each date. Check logs for progress.
+    """
+    _validate_tour(tour)
+    background_tasks.add_task(backfill_tennis_feature_history, tour)
+    return {
+        "status": "started",
+        "tour": tour.upper(),
+        "message": "Tennis feature backfill running in background. Check server logs for progress.",
     }
 
 

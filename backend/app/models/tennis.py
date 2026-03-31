@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey
+from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.models.base import Base
 
@@ -31,6 +31,7 @@ class TennisPlayer(Base):
     logo = Column(String)                   # headshot/flag URL
 
     stats = relationship("TennisPlayerStats", back_populates="player", uselist=False)
+    features = relationship("TennisPlayerFeatures", back_populates="player")
     matches_as_p1 = relationship("TennisMatch", foreign_keys="TennisMatch.player1_id", back_populates="player1")
     matches_as_p2 = relationship("TennisMatch", foreign_keys="TennisMatch.player2_id", back_populates="player2")
 
@@ -79,3 +80,39 @@ class TennisPlayerStats(Base):
     titles = Column(Integer, default=0)
 
     player = relationship("TennisPlayer", back_populates="stats")
+
+
+class TennisPlayerFeatures(Base):
+    __tablename__ = "tennis_player_features"
+    __table_args__ = (UniqueConstraint("player_id", "date", name="uq_tennis_player_features_player_date"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(String, ForeignKey("tennis_players.id"), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    computed_at = Column(DateTime, nullable=False)
+
+    # Form (exponentially weighted, decay=0.85, most-recent = weight 1)
+    form_score_5 = Column(Float)   # last 5 matches
+    form_score_10 = Column(Float)  # last 10 matches
+
+    # Win % over all completed matches up to date
+    overall_win_pct = Column(Float)
+
+    # Win % over the last 20 completed matches (recent trend)
+    recent_win_pct = Column(Float)
+
+    # Surface-specific win % (all completed matches up to date)
+    win_pct_hard = Column(Float)
+    win_pct_clay = Column(Float)
+    win_pct_grass = Column(Float)
+
+    # Match counts per surface (confidence signal)
+    matches_hard = Column(Integer)
+    matches_clay = Column(Integer)
+    matches_grass = Column(Integer)
+
+    # Composite serve / return ratings derived from TennisPlayerStats (0–1, current-only snapshot)
+    serve_rating = Column(Float)
+    return_rating = Column(Float)
+
+    player = relationship("TennisPlayer", back_populates="features")
