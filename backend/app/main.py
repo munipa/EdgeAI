@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
 from app.services.tennis_service import TennisService
 from app.services.feature_service import upsert_team_features, compute_all_nba_features, backfill_nba_features
+from app.ml import nba_model
 from app.services.tennis_feature_service import upsert_player_features, compute_all_tennis_features, backfill_tennis_features as backfill_tennis_feature_history
 from app.database import engine, get_db
 from app.models import Base
@@ -39,6 +40,7 @@ def read_root():
             "/teams/nba/{team_id}/stats", "/teams/nba/{team_id}/form",
             "/teams/nba/h2h", "/injuries/nba", "/teams/nba/{team_id}/features",
             "POST /admin/backfill/nba", "POST /admin/features/nba",
+            "POST /admin/train/nba", "GET /predict/nba",
             "/matches/tennis", "/matches/tennis/today",
             "/matches/tennis/history",
             "/players/tennis",
@@ -486,6 +488,65 @@ def trigger_nba_features(
 
     background_tasks.add_task(_run, as_of)
     return {"status": "started", "date": as_of.isoformat(), "message": "Feature computation running in background."}
+
+
+@app.post("/admin/train/nba")
+def train_nba_model(background_tasks: BackgroundTasks):
+    """
+    Train (or retrain) the NBA prediction model on all available game + feature data.
+    Runs in the background — check logs for accuracy and log-loss metrics.
+    """
+    def _run():
+        from app.database import SessionLocal
+        db = SessionLocal()
+        try:
+            nba_model.train(db)
+        except Exception as e:
+            print(f"NBA model training error: {e}")
+        finally:
+            db.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "message": "NBA model training running in background. Check logs for metrics."}
+
+
+@app.get("/predict/nba")
+def predict_nba_game(
+    home_team_id: str = Query(..., description="Home team ESPN ID"),
+    away_team_id: str = Query(..., description="Away team ESPN ID"),
+    date: str = Query(None, description="As-of date YYYYMMDD. Defaults to today."),
+    db: Session = Depends(get_db),
+):
+    """
+    Predict the outcome of an NBA game between two teams.
+    Returns win probabilities for each side and the predicted winner.
+    """
+    from datetime import date as date_type
+    if date:
+        try:
+            as_of = datetime.strptime(date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+    else:
+        as_of = date_type.today()
+
+    home = db.get(Team, home_team_id)
+    away = db.get(Team, away_team_id)
+    if not home:
+        raise HTTPException(status_code=404, detail=f"Team {home_team_id} not found")
+    if not away:
+        raise HTTPException(status_code=404, detail=f"Team {away_team_id} not found")
+
+    try:
+        result = nba_model.predict(home_team_id, away_team_id, as_of, db)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    result["home_team_name"] = home.name
+    result["away_team_name"] = away.name
+    return result
 
 
 @app.post("/admin/backfill/features/nba")
