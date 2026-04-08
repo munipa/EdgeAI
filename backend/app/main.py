@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
 from app.services.tennis_service import TennisService
 from app.services.feature_service import upsert_team_features, compute_all_nba_features, backfill_nba_features
-from app.ml import nba_model
+from app.ml import nba_model, tennis_model
 from app.services.tennis_feature_service import upsert_player_features, compute_all_tennis_features, backfill_tennis_features as backfill_tennis_feature_history
 from app.database import engine, get_db
 from app.models import Base
@@ -52,6 +52,7 @@ def read_root():
             "/players/tennis/{player_id}/features",
             "POST /admin/features/tennis",
             "POST /admin/backfill/features/tennis",
+            "POST /admin/train/tennis", "GET /predict/tennis",
         ]
     }
 
@@ -1000,6 +1001,74 @@ def backfill_tennis_feature_snapshots(
         "tour": tour.upper(),
         "message": "Tennis feature backfill running in background. Check server logs for progress.",
     }
+
+
+@app.post("/admin/train/tennis")
+def train_tennis_model(
+    background_tasks: BackgroundTasks,
+    tour: str = Query(..., description="'atp' or 'wta'"),
+):
+    """Train (or retrain) the tennis prediction model for a given tour."""
+    _validate_tour(tour)
+
+    def _run(tour):
+        from app.database import SessionLocal
+        db = SessionLocal()
+        try:
+            tennis_model.train(tour, db)
+        except Exception as e:
+            print(f"Tennis model training error [{tour.upper()}]: {e}")
+        finally:
+            db.close()
+
+    background_tasks.add_task(_run, tour)
+    return {"status": "started", "tour": tour.upper(), "message": "Tennis model training running in background. Check logs for metrics."}
+
+
+VALID_SURFACES = {"Hard", "Clay", "Grass"}
+
+
+@app.get("/predict/tennis")
+def predict_tennis_match(
+    player1_id: str = Query(..., description="First player ESPN ID"),
+    player2_id: str = Query(..., description="Second player ESPN ID"),
+    surface: str = Query(..., description="Match surface: Hard, Clay, or Grass"),
+    tour: str = Query(..., description="'atp' or 'wta'"),
+    date: str = Query(None, description="As-of date YYYYMMDD. Defaults to today."),
+    db: Session = Depends(get_db),
+):
+    """
+    Predict the outcome of a tennis match between two players on a given surface.
+    Returns win probabilities and the predicted winner.
+    """
+    _validate_tour(tour)
+    if surface not in VALID_SURFACES:
+        raise HTTPException(status_code=400, detail="surface must be Hard, Clay, or Grass")
+
+    from datetime import date as date_type
+    if date:
+        try:
+            as_of = datetime.strptime(date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+    else:
+        as_of = date_type.today()
+
+    p1 = db.get(TennisPlayer, player1_id)
+    p2 = db.get(TennisPlayer, player2_id)
+    if not p1:
+        raise HTTPException(status_code=404, detail=f"Player {player1_id} not found")
+    if not p2:
+        raise HTTPException(status_code=404, detail=f"Player {player2_id} not found")
+
+    try:
+        result = tennis_model.predict(player1_id, player2_id, surface, tour, as_of, db)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return result
 
 
 def _run_tennis_backfill(tour: str, start: datetime, end: datetime):
