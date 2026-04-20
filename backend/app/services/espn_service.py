@@ -1,7 +1,8 @@
+import time
 import requests
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from app.models.nba import Team, Game, TeamStats, Injury
+from app.models.nba import Team, Game, TeamStats, Injury, NBAPlayer
 
 
 class ESPNService:
@@ -172,10 +173,12 @@ class ESPNService:
             for team_entry in data.get("injuries", []):
                 team_id = team_entry["id"]
                 for inj in team_entry.get("injuries", []):
+                    athlete = inj.get("athlete", {})
                     injury = {
                         "id": inj["id"],
                         "team_id": team_id,
-                        "player_name": inj["athlete"]["displayName"],
+                        "player_name": athlete.get("displayName", ""),
+                        "athlete_id": athlete.get("id"),
                         "status": inj["status"],
                         "comment": inj.get("shortComment", ""),
                         "reported_at": inj.get("date"),
@@ -199,18 +202,101 @@ class ESPNService:
         if existing:
             existing.status = injury["status"]
             existing.comment = injury["comment"]
+            existing.athlete_id = injury.get("athlete_id") or existing.athlete_id
             existing.updated_at = now
         else:
             db.add(Injury(
                 id=injury["id"],
                 team_id=injury["team_id"],
                 player_name=injury["player_name"],
+                athlete_id=injury.get("athlete_id"),
                 status=injury["status"],
                 comment=injury["comment"],
                 reported_at=reported_at,
                 updated_at=now,
             ))
         db.commit()
+
+    def sync_team_roster(self, team_id: str, db: Session) -> list[dict]:
+        """
+        Fetch and persist the NBA roster for one team including per-player PPG.
+        Uses the ESPN web API which includes season statistics per athlete.
+        """
+        url = f"https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/teams/{team_id}/roster"
+        try:
+            response = requests.get(url, params={"season": "2026"})
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching roster for team {team_id}: {e}")
+            return []
+
+        # Athletes are grouped under positionGroups[].athletes[]
+        athlete_list = []
+        for group in data.get("positionGroups", []):
+            athlete_list.extend(group.get("athletes", []))
+
+        players = []
+        now = datetime.now(timezone.utc)
+        for athlete in athlete_list:
+            avg_points, avg_minutes = self._parse_athlete_stats(athlete)
+            player = {
+                "id": str(athlete["id"]),
+                "name": athlete.get("displayName") or athlete.get("fullName", ""),
+                "team_id": team_id,
+                "position": (athlete.get("position") or {}).get("abbreviation"),
+                "jersey": athlete.get("jersey"),
+                "avg_points": avg_points,
+                "avg_minutes": avg_minutes,
+            }
+            players.append(player)
+            existing = db.get(NBAPlayer, player["id"])
+            if existing:
+                for k, v in player.items():
+                    if v is not None:
+                        setattr(existing, k, v)
+                existing.synced_at = now
+            else:
+                db.add(NBAPlayer(**player, synced_at=now))
+
+        db.commit()
+        return players
+
+    def _parse_athlete_stats(self, athlete: dict) -> tuple[float | None, float | None]:
+        """Extract avg_points and avg_minutes from statistics.splits.categories[].stats[]."""
+        avg_points = None
+        avg_minutes = None
+
+        categories = (
+            (athlete.get("statistics") or {})
+            .get("splits", {})
+            .get("categories", [])
+        )
+        for cat in categories:
+            for stat in cat.get("stats", []):
+                name = stat.get("name", "")
+                try:
+                    val = float(stat["value"]) if stat.get("value") is not None else None
+                except (ValueError, TypeError):
+                    val = None
+                if name == "avgPoints" and val:
+                    avg_points = round(val, 2)
+                elif name == "avgMinutes" and val:
+                    avg_minutes = round(val, 2)
+
+        return avg_points, avg_minutes
+
+    def sync_all_rosters(self, db: Session) -> int:
+        """Sync rosters for all 30 NBA teams. Returns total player count."""
+        teams = self.get_all_nba_teams()
+        total = 0
+        for team in teams:
+            players = self.sync_team_roster(team["id"], db)
+            total += len(players)
+            print(f"Roster sync: team {team['id']} ({team.get('displayName', '')}) — {len(players)} players")
+            time.sleep(0.25)
+        print(f"Roster sync complete: {len(teams)} teams, {total} players")
+        return total
 
     def get_nba_standings(self):
         """Get current NBA standings"""

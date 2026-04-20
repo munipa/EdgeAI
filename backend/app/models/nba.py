@@ -16,6 +16,22 @@ class Team(Base):
     stats = relationship("TeamStats", back_populates="team", uselist=False)
     injuries = relationship("Injury", back_populates="team")
     features = relationship("TeamFeatures", back_populates="team")
+    players = relationship("NBAPlayer", back_populates="team")
+
+
+class NBAPlayer(Base):
+    __tablename__ = "nba_players"
+
+    id = Column(String, primary_key=True)   # ESPN athlete ID
+    name = Column(String, nullable=False)
+    team_id = Column(String, ForeignKey("teams.id"), nullable=True)
+    position = Column(String)
+    jersey = Column(String)
+    avg_points = Column(Float)   # PPG this season — used for injury importance weighting
+    avg_minutes = Column(Float)  # MPG this season
+    synced_at = Column(DateTime, nullable=False)
+
+    team = relationship("Team", back_populates="players")
 
 
 class Game(Base):
@@ -63,6 +79,7 @@ class Injury(Base):
     id = Column(String, primary_key=True)  # ESPN injury ID
     team_id = Column(String, ForeignKey("teams.id"), nullable=False)
     player_name = Column(String, nullable=False)
+    athlete_id = Column(String, nullable=True)   # ESPN athlete ID — links to NBAPlayer for importance weighting
     status = Column(String, nullable=False)  # Out, Questionable, Doubtful, etc.
     comment = Column(String)
     reported_at = Column(DateTime)

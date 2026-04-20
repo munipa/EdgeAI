@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Depends, HTTPException, BackgroundTasks
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
 from app.services.tennis_service import TennisService
@@ -8,7 +9,7 @@ from app.ml import nba_model, tennis_model
 from app.services.tennis_feature_service import upsert_player_features, compute_all_tennis_features, backfill_tennis_features as backfill_tennis_feature_history
 from app.database import engine, get_db
 from app.models import Base
-from app.models.nba import Team, Game, TeamStats, Injury, TeamFeatures
+from app.models.nba import Team, Game, TeamStats, Injury, TeamFeatures, NBAPlayer
 from app.models.tennis import TennisPlayer, TennisMatch, TennisPlayerFeatures
 from app import scheduler as sched
 from datetime import datetime, timedelta
@@ -18,6 +19,10 @@ import time
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(bind=engine)
+    # Add athlete_id to injuries if it doesn't exist (safe on re-run via IF NOT EXISTS).
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE injuries ADD COLUMN IF NOT EXISTS athlete_id TEXT"))
+        conn.commit()
     sched.start()
     yield
     sched.stop()
@@ -40,6 +45,7 @@ def read_root():
             "/teams/nba/{team_id}/stats", "/teams/nba/{team_id}/form",
             "/teams/nba/h2h", "/injuries/nba", "/teams/nba/{team_id}/features",
             "POST /admin/backfill/nba", "POST /admin/features/nba",
+            "POST /admin/sync/rosters/nba", "GET /players/nba",
             "POST /admin/train/nba", "GET /predict/nba",
             "/matches/tennis", "/matches/tennis/today",
             "/matches/tennis/history",
@@ -561,6 +567,59 @@ def backfill_nba_feature_history(background_tasks: BackgroundTasks):
     return {
         "status": "started",
         "message": "NBA feature backfill running in background. Check server logs for progress.",
+    }
+
+
+@app.post("/admin/sync/rosters/nba")
+def sync_nba_rosters(background_tasks: BackgroundTasks):
+    """
+    Sync current NBA rosters for all 30 teams from ESPN.
+    Populates the nba_players table with player info and PPG/MPG stats,
+    which are used to weight injury impact by player importance.
+    Run this once (or at the start of a new season) before retraining the model.
+    """
+    def _run():
+        from app.database import SessionLocal
+        db = SessionLocal()
+        try:
+            total = espn.sync_all_rosters(db)
+            print(f"Roster sync complete: {total} players saved")
+        except Exception as e:
+            print(f"Roster sync error: {e}")
+        finally:
+            db.close()
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "started",
+        "message": "NBA roster sync running in background. Check server logs for progress.",
+    }
+
+
+@app.get("/players/nba")
+def get_nba_players(
+    team_id: str = Query(None, description="Filter by team ESPN ID"),
+    db: Session = Depends(get_db),
+):
+    """List NBA players stored in the DB, optionally filtered by team."""
+    query = db.query(NBAPlayer)
+    if team_id:
+        query = query.filter(NBAPlayer.team_id == team_id)
+    players = query.order_by(NBAPlayer.avg_points.desc().nullslast()).all()
+    return {
+        "count": len(players),
+        "players": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "team_id": p.team_id,
+                "position": p.position,
+                "jersey": p.jersey,
+                "avg_points": p.avg_points,
+                "avg_minutes": p.avg_minutes,
+            }
+            for p in players
+        ],
     }
 
 

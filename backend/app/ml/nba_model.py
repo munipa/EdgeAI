@@ -1,14 +1,18 @@
 """
 NBA game outcome prediction model.
 
-Uses logistic regression trained on pre-computed TeamFeatures snapshots.
+Uses gradient boosting trained on pre-computed TeamFeatures snapshots.
 For each completed game, features are the difference between the home and
 away team's snapshot on that game date (home - away), so a positive value
 always favours the home team.
 
 Safe features (computed from historical match data):
     form_score_5, form_score_10, avg_points_scored, avg_points_allowed,
-    win_pct_home, win_pct_away
+    win_pct_home, win_pct_away, off_rating, def_rating
+
+Current-snapshot features (minor leakage risk — stable season-over-season):
+    injury_impact (importance-weighted by player PPG tier; only injuries
+    active within the last 48 hours per the ESPN feed)
 
 Split: time-ordered 80/20 to avoid leaking future results into training.
 """
@@ -18,9 +22,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 from app.models.nba import Game, TeamFeatures
@@ -34,6 +37,9 @@ FEATURES = [
     "pts_allowed_diff",
     "home_win_pct_home",
     "away_win_pct_away",
+    "off_rating_diff",
+    "def_rating_diff",
+    "injury_impact_diff",
 ]
 
 
@@ -41,6 +47,8 @@ def _feature_row(home: TeamFeatures, away: TeamFeatures) -> dict | None:
     """
     Build a feature dict from a home/away TeamFeatures pair.
     Returns None if any required field is missing.
+    off_rating/def_rating fall back to 0.5 (neutral) when TeamStats are absent.
+    injury_impact_diff = away - home so positive means home has fewer injuries.
     """
     required = [
         home.form_score_5, home.form_score_10,
@@ -51,6 +59,13 @@ def _feature_row(home: TeamFeatures, away: TeamFeatures) -> dict | None:
     if any(v is None for v in required):
         return None
 
+    home_off = home.off_rating if home.off_rating is not None else 0.5
+    away_off = away.off_rating if away.off_rating is not None else 0.5
+    home_def = home.def_rating if home.def_rating is not None else 0.5
+    away_def = away.def_rating if away.def_rating is not None else 0.5
+    home_inj = home.injury_impact if home.injury_impact is not None else 0.0
+    away_inj = away.injury_impact if away.injury_impact is not None else 0.0
+
     return {
         "form_5_diff": home.form_score_5 - away.form_score_5,
         "form_10_diff": home.form_score_10 - away.form_score_10,
@@ -58,6 +73,9 @@ def _feature_row(home: TeamFeatures, away: TeamFeatures) -> dict | None:
         "pts_allowed_diff": home.avg_points_allowed - away.avg_points_allowed,
         "home_win_pct_home": home.win_pct_home,
         "away_win_pct_away": away.win_pct_away,
+        "off_rating_diff": home_off - away_off,
+        "def_rating_diff": home_def - away_def,
+        "injury_impact_diff": away_inj - home_inj,
     }
 
 
@@ -128,13 +146,17 @@ def train(db: Session) -> dict:
     X_test = [[row[f] for f in FEATURES] for row in X_test_rows]
 
     pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=1000, random_state=42)),
+        ("clf", GradientBoostingClassifier(
+            n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
+        )),
     ])
     pipeline.fit(X_train, y_train)
 
     y_pred = pipeline.predict(X_test)
     y_prob = pipeline.predict_proba(X_test)
+
+    importances = pipeline.named_steps["clf"].feature_importances_
+    feature_importance = {f: round(float(v), 4) for f, v in zip(FEATURES, importances)}
 
     metrics = {
         "train_games": len(X_train),
@@ -143,6 +165,7 @@ def train(db: Session) -> dict:
         "log_loss": round(log_loss(y_test, y_prob), 4),
         "home_win_rate_train": round(sum(y_train) / len(y_train), 4),
         "home_win_rate_test": round(sum(y_test) / len(y_test), 4),
+        "feature_importance": feature_importance,
     }
 
     joblib.dump({"pipeline": pipeline, "features": FEATURES, "metrics": metrics}, MODEL_PATH)

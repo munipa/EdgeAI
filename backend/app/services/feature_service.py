@@ -6,23 +6,42 @@ them in the team_features table. These snapshots are used for model training
 and fast prediction lookups.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-from app.models.nba import Team, Game, TeamStats, Injury, TeamFeatures
+from app.models.nba import Team, Game, TeamStats, Injury, TeamFeatures, NBAPlayer
 
 # Exponential decay for form score: most recent game has weight 1, each
 # older game is multiplied by DECAY.
 FORM_DECAY = 0.85
 
-# Injury severity weights used for the impact score.
+# Injury severity weights — baseline for an average player.
 INJURY_WEIGHTS = {
     "out": 3.0,
     "doubtful": 2.0,
     "questionable": 1.0,
     "day-to-day": 0.5,
 }
+
+
+def _player_importance_multiplier(avg_points: float | None) -> float:
+    """
+    Scale injury weight by the player's offensive importance.
+    Uses PPG tiers: star (>=20) → 2×, key player (>=12) → 1.5×,
+    starter (>=6) → 1×, bench (<6) → 0.5×.
+    Returns 1.0 (neutral) when PPG is unknown.
+    """
+    if avg_points is None:
+        return 1.0
+    if avg_points >= 20:
+        return 2.0
+    elif avg_points >= 12:
+        return 1.5
+    elif avg_points >= 6:
+        return 1.0
+    else:
+        return 0.5
 
 
 def _weighted_form(results: list[bool]) -> float:
@@ -149,13 +168,53 @@ def _compute_features(team_id: str, as_of: date, db: Session) -> dict:
         def_rating = round(sum(def_components) / len(def_components), 4)
 
     # ------------------------------------------------------------------ #
-    # 6. Injury impact score.                                             #
+    # 6. Injury impact score — weighted by player importance.            #
+    # Only counts injuries reported in the last 30 days, deduplicated   #
+    # per player (most recent record wins) to avoid stacking season-    #
+    # long history for the same player.                                 #
+    # Severity weight × importance multiplier (star=2×, bench=0.5×).   #
     # ------------------------------------------------------------------ #
-    injuries = db.query(Injury).filter(Injury.team_id == team_id).all()
+    # 48-hour window on updated_at — our scheduler refreshes this field on
+    # every sync, so injuries no longer in ESPN's feed fall off automatically.
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    recent_injuries = (
+        db.query(Injury)
+        .filter(
+            Injury.team_id == team_id,
+            Injury.updated_at >= cutoff,
+        )
+        .order_by(Injury.updated_at.desc())
+        .all()
+    )
+
+    # Deduplicate: keep only the most recent entry per player.
+    seen_players: set[str] = set()
+    injuries = []
+    for inj in recent_injuries:
+        if inj.player_name not in seen_players:
+            seen_players.add(inj.player_name)
+            injuries.append(inj)
+
     injury_impact = 0.0
     for inj in injuries:
-        weight = INJURY_WEIGHTS.get(inj.status.lower(), 0.0)
-        injury_impact += weight
+        status_weight = INJURY_WEIGHTS.get(inj.status.lower(), 0.0)
+        if status_weight == 0.0:
+            continue
+
+        # Look up the player: prefer athlete_id (ESPN ID), fall back to name.
+        player: NBAPlayer | None = None
+        if inj.athlete_id:
+            player = db.get(NBAPlayer, inj.athlete_id)
+        if player is None:
+            player = (
+                db.query(NBAPlayer)
+                .filter(NBAPlayer.name == inj.player_name, NBAPlayer.team_id == team_id)
+                .first()
+            )
+
+        importance = _player_importance_multiplier(player.avg_points if player else None)
+        injury_impact += status_weight * importance
+
     injury_impact = round(injury_impact, 2)
 
     return {
