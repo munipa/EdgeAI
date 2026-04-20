@@ -231,3 +231,4 @@ dist/
 # Logs
 logs/
 *.log
+backend/app/ml/nba_model.pkl
