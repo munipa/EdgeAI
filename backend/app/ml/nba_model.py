@@ -37,9 +37,10 @@ FEATURES = [
     "pts_allowed_diff",
     "home_win_pct_home",
     "away_win_pct_away",
-    "off_rating_diff",
-    "def_rating_diff",
+    "injury_adj_off_rating_diff",  # off_rating scaled by PPG% of Out players
+    "injury_adj_def_rating_diff",  # def_rating scaled by MPG% of Out players
     "injury_impact_diff",
+    "superstar_out_diff",           # away - home: positive = away star missing (good for home)
 ]
 
 
@@ -47,8 +48,9 @@ def _feature_row(home: TeamFeatures, away: TeamFeatures) -> dict | None:
     """
     Build a feature dict from a home/away TeamFeatures pair.
     Returns None if any required field is missing.
-    off_rating/def_rating fall back to 0.5 (neutral) when TeamStats are absent.
-    injury_impact_diff = away - home so positive means home has fewer injuries.
+    Adjusted ratings fall back to base ratings when injury data is absent
+    (e.g., historical snapshots before roster sync was introduced).
+    injury_impact_diff / superstar_out_diff = away - home so positive favours home.
     """
     required = [
         home.form_score_5, home.form_score_10,
@@ -59,12 +61,15 @@ def _feature_row(home: TeamFeatures, away: TeamFeatures) -> dict | None:
     if any(v is None for v in required):
         return None
 
-    home_off = home.off_rating if home.off_rating is not None else 0.5
-    away_off = away.off_rating if away.off_rating is not None else 0.5
-    home_def = home.def_rating if home.def_rating is not None else 0.5
-    away_def = away.def_rating if away.def_rating is not None else 0.5
+    # Injury-adjusted ratings fall back to base ratings when not computed.
+    home_adj_off = home.injury_adj_off_rating if home.injury_adj_off_rating is not None else (home.off_rating if home.off_rating is not None else 0.5)
+    away_adj_off = away.injury_adj_off_rating if away.injury_adj_off_rating is not None else (away.off_rating if away.off_rating is not None else 0.5)
+    home_adj_def = home.injury_adj_def_rating if home.injury_adj_def_rating is not None else (home.def_rating if home.def_rating is not None else 0.5)
+    away_adj_def = away.injury_adj_def_rating if away.injury_adj_def_rating is not None else (away.def_rating if away.def_rating is not None else 0.5)
     home_inj = home.injury_impact if home.injury_impact is not None else 0.0
     away_inj = away.injury_impact if away.injury_impact is not None else 0.0
+    home_star_out = home.superstar_out if home.superstar_out is not None else 0.0
+    away_star_out = away.superstar_out if away.superstar_out is not None else 0.0
 
     return {
         "form_5_diff": home.form_score_5 - away.form_score_5,
@@ -73,9 +78,10 @@ def _feature_row(home: TeamFeatures, away: TeamFeatures) -> dict | None:
         "pts_allowed_diff": home.avg_points_allowed - away.avg_points_allowed,
         "home_win_pct_home": home.win_pct_home,
         "away_win_pct_away": away.win_pct_away,
-        "off_rating_diff": home_off - away_off,
-        "def_rating_diff": home_def - away_def,
+        "injury_adj_off_rating_diff": home_adj_off - away_adj_off,
+        "injury_adj_def_rating_diff": home_adj_def - away_adj_def,
         "injury_impact_diff": away_inj - home_inj,
+        "superstar_out_diff": away_star_out - home_star_out,
     }
 
 

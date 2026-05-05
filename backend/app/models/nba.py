@@ -113,6 +113,15 @@ class TeamFeatures(Base):
     off_rating = Column(Float)
     def_rating = Column(Float)
 
+    # Injury-adjusted ratings: base rating scaled down by the PPG/MPG fraction
+    # of players currently listed as Out. Falls back to base rating when no
+    # injury data is available (e.g., historical snapshots).
+    injury_adj_off_rating = Column(Float)
+    injury_adj_def_rating = Column(Float)
+
+    # 1 if any Out player averages >=25 PPG (superstar missing), else 0.
+    superstar_out = Column(Float, default=0.0)
+
     # Injury impact: Out=3, Doubtful=2, Questionable=1, Day-To-Day=0.5
     injury_impact = Column(Float)
 

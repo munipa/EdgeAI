@@ -200,10 +200,11 @@ class ESPNService:
 
         existing = db.get(Injury, injury["id"])
         if existing:
-            existing.status = injury["status"]
+            if existing.status != injury["status"]:
+                existing.status = injury["status"]
+                existing.updated_at = now  # only refresh when status actually changes
             existing.comment = injury["comment"]
             existing.athlete_id = injury.get("athlete_id") or existing.athlete_id
-            existing.updated_at = now
         else:
             db.add(Injury(
                 id=injury["id"],

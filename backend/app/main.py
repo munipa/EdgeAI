@@ -22,6 +22,9 @@ async def lifespan(app):
     # Add athlete_id to injuries if it doesn't exist (safe on re-run via IF NOT EXISTS).
     with engine.connect() as conn:
         conn.execute(text("ALTER TABLE injuries ADD COLUMN IF NOT EXISTS athlete_id TEXT"))
+        conn.execute(text("ALTER TABLE team_features ADD COLUMN IF NOT EXISTS injury_adj_off_rating REAL"))
+        conn.execute(text("ALTER TABLE team_features ADD COLUMN IF NOT EXISTS injury_adj_def_rating REAL"))
+        conn.execute(text("ALTER TABLE team_features ADD COLUMN IF NOT EXISTS superstar_out REAL DEFAULT 0.0"))
         conn.commit()
     sched.start()
     yield
@@ -554,6 +557,31 @@ def predict_nba_game(
     result["home_team_name"] = home.name
     result["away_team_name"] = away.name
     return result
+
+
+@app.post("/admin/sync/injuries/nba")
+def sync_nba_injuries(background_tasks: BackgroundTasks):
+    """
+    Manually re-sync the NBA injury report from ESPN and recompute today's features.
+    Use this before generating predictions on game days to get current designations.
+    """
+    from datetime import date as date_type
+
+    def _run():
+        from app.database import SessionLocal
+        db = SessionLocal()
+        try:
+            espn.get_nba_injuries(db=db)
+            print("Manual injury sync complete")
+            compute_all_nba_features(date_type.today(), db)
+            print("Features recomputed after injury sync")
+        except Exception as e:
+            print(f"Manual injury sync error: {e}")
+        finally:
+            db.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "message": "Injury sync + feature recompute running in background."}
 
 
 @app.post("/admin/backfill/features/nba")

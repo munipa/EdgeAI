@@ -174,16 +174,18 @@ def _compute_features(team_id: str, as_of: date, db: Session) -> dict:
     # long history for the same player.                                 #
     # Severity weight × importance multiplier (star=2×, bench=0.5×).   #
     # ------------------------------------------------------------------ #
-    # 48-hour window on updated_at — our scheduler refreshes this field on
-    # every sync, so injuries no longer in ESPN's feed fall off automatically.
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    # Use reported_at (when ESPN created the entry) rather than updated_at
+    # (which we used to refresh on every sync, making it useless as a staleness
+    # signal). A 14-day window covers ongoing playoff injuries while naturally
+    # excluding old per-game "Out" entries for players who have since returned.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
     recent_injuries = (
         db.query(Injury)
         .filter(
             Injury.team_id == team_id,
-            Injury.updated_at >= cutoff,
+            Injury.reported_at >= cutoff,
         )
-        .order_by(Injury.updated_at.desc())
+        .order_by(Injury.reported_at.desc())
         .all()
     )
 
@@ -196,6 +198,10 @@ def _compute_features(team_id: str, as_of: date, db: Session) -> dict:
             injuries.append(inj)
 
     injury_impact = 0.0
+    out_ppg = 0.0      # PPG of confirmed-Out players (for off rating adjustment)
+    out_mpg = 0.0      # MPG of confirmed-Out players (for def rating adjustment)
+    superstar_out = 0.0
+
     for inj in injuries:
         status_weight = INJURY_WEIGHTS.get(inj.status.lower(), 0.0)
         if status_weight == 0.0:
@@ -215,7 +221,40 @@ def _compute_features(team_id: str, as_of: date, db: Session) -> dict:
         importance = _player_importance_multiplier(player.avg_points if player else None)
         injury_impact += status_weight * importance
 
+        # Accumulate Out-only stats for rating adjustments.
+        if inj.status.lower() == "out" and player:
+            if player.avg_points:
+                out_ppg += player.avg_points
+                if player.avg_points >= 25.0:
+                    superstar_out = 1.0
+            if player.avg_minutes:
+                out_mpg += player.avg_minutes
+
     injury_impact = round(injury_impact, 2)
+
+    # ------------------------------------------------------------------ #
+    # 7. Injury-adjusted ratings.                                          #
+    # Scale off_rating by the fraction of PPG still available, and        #
+    # def_rating by the fraction of MPG still available. When roster      #
+    # data is absent (no NBAPlayer rows), fall back to the base rating.   #
+    # ------------------------------------------------------------------ #
+    team_players = (
+        db.query(NBAPlayer).filter(NBAPlayer.team_id == team_id).all()
+    )
+    total_ppg = sum(p.avg_points for p in team_players if p.avg_points is not None)
+    total_mpg = sum(p.avg_minutes for p in team_players if p.avg_minutes is not None)
+
+    if off_rating is not None:
+        off_avail = max(0.0, 1.0 - out_ppg / total_ppg) if total_ppg > 0 else 1.0
+        injury_adj_off_rating = round(off_rating * off_avail, 4)
+    else:
+        injury_adj_off_rating = None
+
+    if def_rating is not None:
+        def_avail = max(0.0, 1.0 - out_mpg / total_mpg) if total_mpg > 0 else 1.0
+        injury_adj_def_rating = round(def_rating * def_avail, 4)
+    else:
+        injury_adj_def_rating = None
 
     return {
         "team_id": team_id,
@@ -228,6 +267,9 @@ def _compute_features(team_id: str, as_of: date, db: Session) -> dict:
         "win_pct_away": win_pct_away,
         "off_rating": off_rating,
         "def_rating": def_rating,
+        "injury_adj_off_rating": injury_adj_off_rating,
+        "injury_adj_def_rating": injury_adj_def_rating,
+        "superstar_out": superstar_out,
         "injury_impact": injury_impact,
     }
 

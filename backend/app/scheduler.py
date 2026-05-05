@@ -110,6 +110,11 @@ def start():
     scheduler.add_job(sync_nba_team_stats, "cron", hour=3, minute=5)
     scheduler.add_job(sync_nba_injuries, "cron", hour=3, minute=10)
     scheduler.add_job(compute_nba_features, "cron", hour=3, minute=15)
+    # Re-sync injuries + recompute features around game time so injury
+    # designations (Active/Out/Questionable) are current for predictions.
+    for hour in (12, 16, 19):
+        scheduler.add_job(sync_nba_injuries, "cron", hour=hour, minute=0)
+        scheduler.add_job(compute_nba_features, "cron", hour=hour, minute=5)
     # Tennis daily at 3:20am (sync), 3:30am (features)
     scheduler.add_job(sync_todays_atp_matches, "cron", hour=3, minute=20)
     scheduler.add_job(sync_todays_wta_matches, "cron", hour=3, minute=25)
