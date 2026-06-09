@@ -2,32 +2,149 @@
 
 import { useEffect, useState, Suspense } from "react"
 import { useSearchParams } from "next/navigation"
-import { getTeams, predictNBA } from "@/services/api"
-import type { Team, PredictionResult } from "@/types/nba"
+import { getTeams, predictNBA, getInjuries } from "@/services/api"
+import type { Team, PredictionResult, Injury } from "@/types/nba"
 
-function ProbBar({ homeProb, homeName, awayName }: { homeProb: number; homeName: string; awayName: string }) {
+const FEATURE_LABELS: Record<string, string> = {
+  form_5_diff: "Form (last 5 games)",
+  form_10_diff: "Form (last 10 games)",
+  pts_scored_diff: "Avg points scored diff",
+  pts_allowed_diff: "Avg points allowed diff",
+  home_win_pct_home: "Home team win % at home",
+  away_win_pct_away: "Away team win % on road",
+  injury_adj_off_rating_diff: "Injury-adj offensive rating diff",
+  injury_adj_def_rating_diff: "Injury-adj defensive rating diff",
+  injury_impact_diff: "Injury impact diff",
+  superstar_out_diff: "Superstar out diff",
+}
+
+const STATUS_STYLES: Record<string, string> = {
+  Out: "bg-red-900/40 text-red-400",
+  Doubtful: "bg-orange-900/40 text-orange-400",
+  Questionable: "bg-yellow-900/40 text-yellow-400",
+  "Day-To-Day": "bg-yellow-900/40 text-yellow-400",
+  Suspension: "bg-purple-900/40 text-purple-400",
+}
+
+function ProbBar({
+  homeProb,
+  homeName,
+  awayName,
+}: {
+  homeProb: number
+  homeName: string
+  awayName: string
+}) {
   const homePct = Math.round(homeProb * 100)
   const awayPct = 100 - homePct
+  const homeWins = homeProb >= 0.5
+
   return (
-    <div className="mt-6">
-      <div className="flex justify-between text-sm font-semibold text-white mb-2">
-        <span>{awayName}</span>
-        <span>{homeName}</span>
+    <div className="mt-2">
+      <div className="flex justify-between text-sm font-semibold mb-2">
+        <span className={!homeWins ? "text-[var(--green)]" : "text-[var(--text-muted)]"}>
+          {awayName}
+          {!homeWins && " ✓"}
+        </span>
+        <span className={homeWins ? "text-[var(--green)]" : "text-[var(--text-muted)]"}>
+          {homeWins && "✓ "}
+          {homeName}
+        </span>
       </div>
-      <div className="flex h-4 rounded-full overflow-hidden">
+      <div className="flex h-5 rounded-full overflow-hidden">
         <div
-          className="bg-[var(--red)] transition-all duration-500"
+          className="bg-[var(--red)] transition-all duration-700 flex items-center justify-end pr-2"
           style={{ width: `${awayPct}%` }}
-        />
+        >
+          {awayPct > 15 && (
+            <span className="text-white text-xs font-bold">{awayPct}%</span>
+          )}
+        </div>
         <div
-          className="bg-[var(--green)] transition-all duration-500"
+          className="bg-[var(--green)] transition-all duration-700 flex items-center justify-start pl-2"
           style={{ width: `${homePct}%` }}
-        />
+        >
+          {homePct > 15 && (
+            <span className="text-white text-xs font-bold">{homePct}%</span>
+          )}
+        </div>
       </div>
       <div className="flex justify-between text-xs text-[var(--text-muted)] mt-1">
-        <span>{awayPct}%</span>
-        <span>{homePct}%</span>
+        <span>Away</span>
+        <span>Home</span>
       </div>
+    </div>
+  )
+}
+
+function TeamSelect({
+  label,
+  value,
+  teams,
+  onChange,
+  exclude,
+}: {
+  label: string
+  value: string
+  teams: Team[]
+  onChange: (id: string) => void
+  exclude: string
+}) {
+  const selected = teams.find((t) => t.id === value)
+
+  return (
+    <div>
+      <label className="block text-xs text-[var(--text-muted)] mb-1.5 font-medium uppercase tracking-wide">
+        {label}
+      </label>
+      <div className="relative">
+        {selected?.logo && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={selected.logo}
+            alt=""
+            className="absolute left-3 top-1/2 -translate-y-1/2 w-6 h-6 object-contain pointer-events-none"
+          />
+        )}
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={`w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-lg py-2.5 pr-3 text-sm text-white focus:outline-none focus:border-[var(--accent)] appearance-none ${
+            selected?.logo ? "pl-11" : "pl-3"
+          }`}
+        >
+          <option value="">Select team...</option>
+          {teams
+            .filter((t) => t.id !== exclude)
+            .map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name}
+              </option>
+            ))}
+        </select>
+      </div>
+    </div>
+  )
+}
+
+function InjuryList({ teamId, injuries }: { teamId: string; injuries: Injury[] }) {
+  const teamInjuries = injuries.filter((i) => i.team_id === teamId)
+  if (teamInjuries.length === 0) return <p className="text-xs text-[var(--text-muted)]">No active injuries</p>
+
+  return (
+    <div className="space-y-1.5">
+      {teamInjuries.map((inj, i) => (
+        <div key={i} className="flex items-center justify-between gap-2">
+          <span className="text-xs text-white truncate">{inj.player_name}</span>
+          <span
+            className={`text-xs px-1.5 py-0.5 rounded font-medium shrink-0 ${
+              STATUS_STYLES[inj.status] ?? "bg-[var(--surface-2)] text-[var(--text-muted)]"
+            }`}
+          >
+            {inj.status}
+          </span>
+        </div>
+      ))}
     </div>
   )
 }
@@ -35,6 +152,7 @@ function ProbBar({ homeProb, homeName, awayName }: { homeProb: number; homeName:
 function PredictContent() {
   const params = useSearchParams()
   const [teams, setTeams] = useState<Team[]>([])
+  const [injuries, setInjuries] = useState<Injury[]>([])
   const [homeId, setHomeId] = useState(params.get("home") ?? "")
   const [awayId, setAwayId] = useState(params.get("away") ?? "")
   const [result, setResult] = useState<PredictionResult | null>(null)
@@ -43,6 +161,7 @@ function PredictContent() {
 
   useEffect(() => {
     getTeams().then((r) => setTeams(r.teams)).catch(() => {})
+    getInjuries().then((r) => setInjuries(r.injuries)).catch(() => {})
   }, [])
 
   async function handlePredict() {
@@ -60,11 +179,8 @@ function PredictContent() {
     }
   }
 
-  const winner = result
-    ? result.predicted_winner === "home"
-      ? result.home_team_name
-      : result.away_team_name
-    : null
+  const homeTeam = teams.find((t) => t.id === homeId)
+  const awayTeam = teams.find((t) => t.id === awayId)
 
   return (
     <div className="p-8 max-w-2xl mx-auto">
@@ -74,42 +190,22 @@ function PredictContent() {
       </p>
 
       {/* Team selectors */}
-      <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl p-6 mb-6">
-        <div className="grid sm:grid-cols-2 gap-4 mb-4">
-          <div>
-            <label className="block text-xs text-[var(--text-muted)] mb-1.5 font-medium uppercase tracking-wide">
-              Away Team
-            </label>
-            <select
-              value={awayId}
-              onChange={(e) => setAwayId(e.target.value)}
-              className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[var(--accent)]"
-            >
-              <option value="">Select team...</option>
-              {teams.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs text-[var(--text-muted)] mb-1.5 font-medium uppercase tracking-wide">
-              Home Team
-            </label>
-            <select
-              value={homeId}
-              onChange={(e) => setHomeId(e.target.value)}
-              className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[var(--accent)]"
-            >
-              <option value="">Select team...</option>
-              {teams.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-          </div>
+      <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl p-6 mb-4">
+        <div className="grid sm:grid-cols-2 gap-4 mb-5">
+          <TeamSelect
+            label="Away Team"
+            value={awayId}
+            teams={teams}
+            onChange={(id) => { setAwayId(id); setResult(null) }}
+            exclude={homeId}
+          />
+          <TeamSelect
+            label="Home Team"
+            value={homeId}
+            teams={teams}
+            onChange={(id) => { setHomeId(id); setResult(null) }}
+            exclude={awayId}
+          />
         </div>
 
         <button
@@ -121,6 +217,28 @@ function PredictContent() {
         </button>
       </div>
 
+      {/* Injury context for selected teams */}
+      {(homeId || awayId) && injuries.length > 0 && (
+        <div className="grid sm:grid-cols-2 gap-3 mb-6">
+          {awayId && awayTeam && (
+            <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl p-4">
+              <p className="text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wide mb-2">
+                {awayTeam.name} injuries
+              </p>
+              <InjuryList teamId={awayId} injuries={injuries} />
+            </div>
+          )}
+          {homeId && homeTeam && (
+            <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl p-4">
+              <p className="text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wide mb-2">
+                {homeTeam.name} injuries
+              </p>
+              <InjuryList teamId={homeId} injuries={injuries} />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Error */}
       {error && (
         <div className="bg-red-900/30 border border-red-800 rounded-xl p-4 mb-6 text-sm text-red-400">
@@ -131,12 +249,9 @@ function PredictContent() {
       {/* Result */}
       {result && (
         <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl p-6">
-          <div className="flex items-center justify-between mb-4">
-            <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide font-medium">
-              Predicted winner
-            </p>
-            <span className="text-sm font-bold text-[var(--green)]">{winner}</span>
-          </div>
+          <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide font-medium mb-4">
+            Prediction
+          </p>
 
           <ProbBar
             homeProb={result.home_win_probability}
@@ -149,12 +264,14 @@ function PredictContent() {
             <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide font-medium mb-3">
               Model features
             </p>
-            <div className="grid gap-1.5">
+            <div className="grid gap-2">
               {Object.entries(result.features_used).map(([key, val]) => (
-                <div key={key} className="flex items-center justify-between text-xs">
-                  <span className="text-[var(--text-muted)] font-mono">{key}</span>
+                <div key={key} className="flex items-center justify-between gap-4">
+                  <span className="text-xs text-[var(--text-muted)]">
+                    {FEATURE_LABELS[key] ?? key}
+                  </span>
                   <span
-                    className={`font-semibold tabular-nums ${
+                    className={`text-xs font-semibold tabular-nums shrink-0 ${
                       val > 0 ? "text-[var(--green)]" : val < 0 ? "text-[var(--red)]" : "text-white"
                     }`}
                   >

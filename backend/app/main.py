@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Depends, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.services.espn_service import ESPNService
@@ -32,6 +33,13 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Sports Analytics API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # Create an instance of our ESPN service
 espn = ESPNService()
@@ -216,8 +224,26 @@ def get_team_stats(team_id: str, db: Session = Depends(get_db)):
 
 @app.get("/injuries/nba")
 def get_nba_injuries(db: Session = Depends(get_db)):
-    """Get current NBA injury report from the DB"""
-    injuries = db.query(Injury).order_by(Injury.team_id, Injury.reported_at.desc()).all()
+    """Get current NBA injury report — deduplicated, 14-day window, most recent per player."""
+    from datetime import timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+
+    raw = (
+        db.query(Injury)
+        .filter(Injury.reported_at >= cutoff)
+        .order_by(Injury.team_id, Injury.reported_at.desc())
+        .all()
+    )
+
+    # Keep only the most recent record per (team, player).
+    seen: set[tuple[str, str]] = set()
+    injuries = []
+    for i in raw:
+        key = (i.team_id, i.player_name)
+        if key not in seen:
+            seen.add(key)
+            injuries.append(i)
+
     return {
         "count": len(injuries),
         "injuries": [
